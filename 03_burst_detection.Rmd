@@ -1,0 +1,355 @@
+---
+title: "03 Burst Detection (Kleinberg)"
+author: "Julia Mayer"
+date: "2026-06-19"
+output: html_document
+---
+
+Dieses Skript setzt die Burst Detection und die Bestimmung der Vergleichsphasen aus Kapitel 3.5 um. Mit dem Algorithmus von Kleinberg (2003) werden Phasen
+erhöhter Aktivität in der Stichprobe bestimmt. Die drei intensivsten Phasen dienen als Vergleichseinheiten für FF1.3.
+
+Eingabe `data/tweets_topic_final.rds` (aus `01_datenbereinigung.Rmd`), für Abschnitt 8 zusätzlich `data/Kantenliste_Ereignisse.rds` und `data/outlet_medium.rds` (aus `02_netzwerk_listen.Rmd`)
+Ausgabe Abbildung in `output/`, `sensitivity_phases.csv` und `Kantenliste_gewichtet_Burstphasen.rds` in `data/`
+
+Erwartetes Ergebnis: 12 Phasen bei einer maximalen Lücke von drei Tagen. Drei davon erreichen mindestens Burst-Level 4: 07.10. bis 09.12.2023 (Level 6),
+21. bis 22.05.2024 (Level 4) und 17. bis 18.10.2024 (Level 4).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pakete
+
+```{r pakete, message=FALSE}
+library(dplyr)      # Datenaufbereitung
+library(tidyr)      # pivot_wider(), replace_na()
+library(purrr)      # map_dfr() für die Sensitivitätsanalyse
+library(lubridate)  # Umrechnung der Zeitstempel
+library(readr)      # Import und Export
+library(bursts)     # Kleinberg-Algorithmus
+library(here)       # Pfade relativ zum Projektordner
+```
+
+# 1. Import
+
+```{r import}
+
+tweets_topic_final <- read_rds(here("data", "tweets_topic_final.rds"))
+
+# Der Unix-Zeitstempel (Sekunden seit dem 01.01.1970) wird in Datum und Uhrzeit umgerechnet. Als Zeitzone gilt durchgehend UTC, damit die Tagesgrenzen auf jedem Rechner gleich liegen.
+
+tweets_time <- tweets_topic_final %>%
+  mutate(
+    datetime = as_datetime(unix_timestamp, tz = "UTC"),
+    date = as.Date(datetime)) %>%
+  filter(!is.na(date))
+
+# Kontrolle: Durch die Umrechnung darf kein X-Beitrag verloren gehen.
+# Beide Werte müssen gleich sein.
+
+nrow(tweets_topic_final); nrow(tweets_time)
+
+# Kontrolle: erster und letzter Tag im Datensatz
+
+range(tweets_time$date)
+```
+
+# 2. Tagesverlauf
+
+```{r tagesverlauf}
+# Zahl der X-Beiträge je Tag
+
+tweet_counts_daily <- tweets_time %>%
+  count(date, name = "n_tweets") %>%
+  arrange(date)
+
+# Die 20 Tage mit den meisten X-Beiträgen
+
+tweet_counts_daily %>%
+  arrange(desc(n_tweets)) %>%
+  head(20)
+```
+
+```{r abbildung-tagesverlauf}
+
+# Abbildung: zeitliche Verteilung der X-Beiträge über den Untersuchungszeitraum, Gestaltung nach APA 7
+
+abb_tweetverteilung <- ggplot(
+  tweet_counts_daily,
+  aes(x = date, y = n_tweets)) +
+  geom_line(linewidth = 0.30, colour = "black") +
+  scale_x_date(limits = as.Date(c("2023-10-01", "2026-04-30")),
+               breaks = seq(from = as.Date("2023-10-01"),
+                            to   = as.Date("2026-04-01"),
+                            by   = "4 months"),
+               date_labels = "%m/%Y",
+    expand = expansion(mult = c(0, 0.01))) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 6),
+                     expand = expansion(mult = c(0, 0.03))) +
+  labs(x = "Datum",
+       y = "Tweets pro Tag") +
+  theme_classic(base_size = 10) +
+  theme(text = element_text(family = "Times New Roman", colour = "black"),
+        axis.title = element_text(size = 10, face = "plain"),
+        axis.text = element_text(size = 8.5, colour = "black"),
+        axis.text.x = element_text(angle = 0, hjust = 0.5),
+        axis.line = element_line(linewidth = 0.4, colour = "black"),
+        axis.ticks = element_line(linewidth = 0.3, colour = "black"),
+        plot.margin = margin(t = 5, r = 10, b = 5, l = 5))
+
+abb_tweetverteilung
+
+# Export als PNG in Druckauflösung
+
+ggsave(
+  filename = here("output", "Abbildung_Tweetverteilung.png"),
+  plot = abb_tweetverteilung,
+  width = 16.5,
+  height = 7.5,
+  units = "cm",
+  dpi = 600,
+  bg = "white")
+```
+
+# 3. Kleinberg-Algorithmus
+
+```{r kleinberg}
+# Der Algorithmus erwartet eine Ereignisfolge: für jeden X-Beitrag einen Zeitpunkt, gemessen als Abstand zum ersten Beitrag. Verwendet werden
+# die sekundengenauen Zeitstempel, nicht die Tageswerte.
+
+start_time <- min(tweets_time$datetime, na.rm = TRUE)
+
+tweet_events <- tweets_time %>%
+  arrange(datetime) %>%
+  mutate(offset_seconds = as.numeric(difftime(datetime, start_time, units = "secs")))
+
+# Der Algorithmus rechnet mit den Abständen zwischen aufeinanderfolgenden Ereignissen und akzeptiert deshalb keine zwei Ereignisse zum selben
+# Zeitpunkt. Zahl der X-Beiträge mit einem bereits belegten Zeitpunkt:
+
+sum(duplicated(tweet_events$offset_seconds))
+
+# Identische Zeitpunkte werden künstlich um je eine Millisekunde auseinandergezogen. Der erste Beitrag behält seinen Zeitpunkt, der zweite erhält + 0,001 Sekunden, der dritte + 0,002 Sekunden usw.
+# Auf die Lage der Bursts hat diese Verschiebung keinen Einfluss.
+
+tweet_events <- tweet_events %>%
+  group_by(offset_seconds) %>%
+  mutate(offset_seconds_strict = offset_seconds + (row_number() - 1) * 0.001) %>%
+  ungroup()
+
+# Kontrolle: Der Wert muss jetzt 0 sein.
+
+sum(duplicated(tweet_events$offset_seconds_strict))
+
+# Kleinberg-Algorithmus mit den Standardparametern des Pakets (s = 2, gamma = 1). Das Ergebnis ist eine Liste von Bursts mit Level,
+# Beginn und Ende. Level 1 ist das Grundniveau und umfasst den gesamten Zeitraum. Höhere Level stehen für dichtere Abfolgen von Beiträgen und
+# liegen jeweils innerhalb eines Bursts des niedrigeren Levels.
+
+burst_result <- kleinberg(
+  tweet_events$offset_seconds_strict)
+
+# Beginn und Ende liegen als Sekunden seit dem ersten Beitrag vor und werden in Datum und Uhrzeit zurückgerechnet.
+
+bursts_df <- as.data.frame(burst_result) %>%
+  mutate(
+    burst_start_datetime = start_time + start,
+    burst_end_datetime = start_time + end,
+    burst_start_date = as.Date(burst_start_datetime),
+    burst_end_date = as.Date(burst_end_datetime))
+
+bursts_df %>%
+  select(
+    level,
+    burst_start_date,
+    burst_end_date,
+    burst_start_datetime,
+    burst_end_datetime)
+```
+
+# 4. Phasenbildung
+
+```{r phasen}
+# Der Algorithmus liefert viele kurze Bursts, die oft direkt aufeinander folgen. Die Funktion fasst sie zu Phasen zusammen.
+#
+#   - min_level:    Nur Bursts ab diesem Level werden berücksichtigt.
+#   - max_gap_days: Liegen zwischen dem Ende eines Bursts und dem Beginn
+#                   des nächsten höchstens so viele Tage, gehören beide
+#                   zur selben Phase. Bei einer größeren Lücke beginnt
+#                   eine neue Phase.
+#
+# Vorgehen: Die Bursts werden nach Beginn sortiert. Für jeden Burst wird das späteste Ende aller vorherigen Bursts bestimmt (cummax) und der
+# Abstand dazu berechnet. Das späteste statt des letzten Endes ist nötig, weil Bursts höherer Level in längeren Bursts niedrigerer Level liegen.
+#
+# Ergebnis je Phase: Beginn, Ende, höchstes erreichtes Level, Zahl der
+# zusammengefassten Bursts und Dauer in Tagen.
+
+build_burst_phases <- function(bursts_df, max_gap_days = 7, min_level = 3) {
+  bursts_candidates <- bursts_df %>%
+    filter(level >= min_level) %>%
+    arrange(burst_start_date, desc(burst_end_date)) %>%
+    mutate(
+      previous_max_end_num = lag(cummax(as.numeric(burst_end_date))),
+      previous_max_end = as.Date(previous_max_end_num, origin = "1970-01-01"),
+      gap_days = as.numeric(burst_start_date - previous_max_end),
+      new_phase = if_else(is.na(gap_days) | gap_days > max_gap_days, 1L, 0L),
+      phase_id = cumsum(new_phase))
+
+  bursts_candidates %>%
+    group_by(phase_id) %>%
+    summarise(
+      phase_start = min(burst_start_date),
+      phase_end = max(burst_end_date),
+      max_level = max(level, na.rm = TRUE),
+      n_bursts = n(),
+      duration_days = as.numeric(max(burst_end_date) - min(burst_start_date)) + 1,
+      .groups = "drop") %>%
+    mutate(max_gap_days = max_gap_days) %>%
+    relocate(max_gap_days)}
+
+# Finale Phasen: Bursts ab Level 3, maximale Lücke von drei Tagen.
+# Der Schwellenwert ist über die Sensitivitätsanalyse unten begründet (Plateaubeginn bei einer Lücke von drei Tagen).
+
+bursts_phases <- build_burst_phases(bursts_df, max_gap_days = 3, min_level = 3)
+bursts_phases
+```
+
+```{r sensitivitaet}
+# Sensitivitätsanalyse: Die Phasenbildung wird mit acht verschiedenen Lückenwerten wiederholt. So zeigt sich, wie stark das Ergebnis von der
+# Wahl des Schwellenwerts abhängt.
+
+gap_values <- c(0, 1, 2, 3, 5, 7, 10, 14)
+
+sensitivity_phases <- map_dfr(
+  gap_values,
+  ~ build_burst_phases(bursts_df, max_gap_days = .x, min_level = 3))
+
+# Ausgabe für die Phasen bis Ende 2023. In diesem Abschnitt wirkt sich die Wahl der Lücke am stärksten aus.
+
+sensitivity_phases %>%
+  filter(phase_start < as.Date("2024-01-01")) %>%
+  select(max_gap_days, phase_id, phase_start, phase_end, duration_days, n_bursts) %>%
+  arrange(max_gap_days, phase_start)
+
+write_csv(sensitivity_phases, here("data", "sensitivity_phases.csv"))
+```
+
+# 5. Kennzahlen je Phase
+
+```{r phasen-kennzahlen}
+# Für jede Phase:
+#   - n_tweets:          Zahl der X-Beiträge zwischen Beginn und Ende
+#   - tweets_per_day:    X-Beiträge je Tag der Phase
+#   - n_active_accounts: Zahl der Accounts mit mindestens einem Beitrag
+# rowwise() sorgt dafür, dass die Berechnung für jede Phase einzeln mit deren Beginn und Ende läuft.
+
+bursts_phases <- bursts_phases %>%
+  rowwise() %>%
+  mutate(n_tweets = tweets_time %>%
+           filter(date >= phase_start,
+                  date <= phase_end) %>%
+           nrow(),
+         tweets_per_day = n_tweets / duration_days,
+         n_active_accounts = tweets_time %>%
+           filter(date >= phase_start,
+                  date <= phase_end) %>%
+           summarise(n = n_distinct(author)) %>%
+           pull(n)) %>%
+  ungroup()
+
+bursts_phases %>%
+  select(phase_id, phase_start, phase_end, duration_days, n_bursts,
+         n_tweets, tweets_per_day, n_active_accounts) %>%
+  arrange(phase_id)
+
+# Als Vergleichsphasen für FF1.3 dienen nur Phasen, die mindestens Burst-Level 4 erreichen.
+
+phasen_auswahl <- bursts_phases %>% filter(max_level >= 4)
+phasen_auswahl %>% select(phase_id, phase_start, phase_end, max_level)
+```
+
+# 6. Kanten je Vergleichsphase
+
+```{r kanten-voraussetzung}
+# Liste der Redaktionsaccounts aus Skript 02
+
+outlet_accounts <- read_rds(here("data", "outlet_medium.rds"))$target
+```
+
+```{r kanten-phasen}
+# Ereignisliste laden. Bezugnahmen auf Redaktionsaccounts der untersuchten Medien werden ausgeschlossen.
+
+ev_bereinigt <- read_rds(here("data", "Kantenliste_Ereignisse.rds")) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(!target %in% outlet_accounts)
+
+# Jedes Ereignis wird der Vergleichsphase zugeordnet, in deren Zeitraum sein Datum fällt. Ereignisse außerhalb der drei Phasen fallen weg.
+
+edges_burst_phases <- ev_bereinigt %>%
+  inner_join(phasen_auswahl %>% select(phase_id, phase_start, phase_end),
+             join_by(date >= phase_start, date <= phase_end))
+
+# Kontrolle: Zahl der Ereignisse je Phase
+
+edges_burst_phases %>% count(phase_id)
+
+# Netzwerkgröße je Phase
+#   - n_edge_events:    Zahl der Ereignisse
+#   - n_unique_edges:   Zahl der verschiedenen Paare aus Ego und Alter
+#   - n_network_tweets: Zahl der zugrunde liegenden X-Beiträge
+#   - n_nodes:          Zahl der beteiligten Accounts
+#   - n_source_nodes:   Zahl der aktiven Egos
+#   - n_target_nodes:   Zahl der adressierten Accounts
+
+phase_network_sizes <- edges_burst_phases %>%
+  group_by(phase_id) %>%
+  summarise(
+    n_edge_events    = n(),
+    n_unique_edges   = n_distinct(paste(source, target, sep = " -> ")),
+    n_network_tweets = n_distinct(tweet_id),
+    n_nodes          = n_distinct(c(source, target)),
+    n_source_nodes   = n_distinct(source),
+    n_target_nodes   = n_distinct(target),
+    .groups = "drop")
+
+# Zahl der Ereignisse je Interaktionstyp und Phase
+
+phase_edge_types <- edges_burst_phases %>%
+  count(phase_id, type, name = "n_edge_events") %>%
+  pivot_wider(
+    names_from = type,
+    values_from = n_edge_events,
+    values_fill = 0,
+    names_prefix = "n_")
+
+# Übersicht: Phasen mit Netzwerkgröße und Interaktionstypen
+
+burst_phase_overview <- phasen_auswahl %>%
+  left_join(phase_network_sizes, by = "phase_id") %>%
+  left_join(phase_edge_types, by = "phase_id") %>%
+  arrange(phase_id)
+
+burst_phase_overview
+```
+
+```{r kanten-phasen-gewichtet}
+# Gewichtete Kantenliste je Phase, gebaut wie die Gesamtliste in 02_netzwerk_listen.Rmd: Ereignisse je Paar aus Ego und Alter zählen,
+# getrennt nach Typ, weight_total als Summe.
+
+edges_weighted_phases <- edges_burst_phases %>%
+  count(phase_id, source, target, type, name = "n") %>%
+  pivot_wider(names_from = type, values_from = n,
+              values_fill = 0, names_prefix = "n_") %>%
+  mutate(across(starts_with("n_"), ~ replace_na(.x, 0)),
+         weight_total = rowSums(across(starts_with("n_")))) %>%
+  select(phase_id, source, target, weight_total, everything()) %>%
+  arrange(phase_id, desc(weight_total))
+
+# Kontrolle: Zahl der Kanten und der Ereignisse je Phase
+
+edges_weighted_phases %>%
+  group_by(phase_id) %>%
+  summarise(n_dyaden = n(), n_ereignisse = sum(weight_total), .groups = "drop")
+
+# Für die Phasenvergleiche in den weiteren Skripten speichern
+
+write_rds(edges_weighted_phases, here("data", "Kantenliste_gewichtet_Burstphasen.rds"))
+```
