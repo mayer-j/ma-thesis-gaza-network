@@ -1,0 +1,205 @@
+---
+title: "01 Datenbereinigung und Themenfilter"
+output: html_document
+date: "2026-06-12"
+---
+
+Dieses Skript setzt die Datenbereinigung und -aufbereitung aus Kapitel 3.3 um.
+Aus den Rohdaten werden zuerst die netzwerkrelevanten X-Beiträge ausgewählt und
+danach über einen zweistufigen Themenfilter auf den Gaza-Diskurs eingegrenzt.
+
+Eingabe `data/Tweets_Rohdaten.xlsx` (Export aus 4CAT, eine Zeile je X-Beitrag)
+Ausgabe `data/tweets_topic_final.rds` als Grundlage aller weiteren Skripte, zusätzlich als CSV und XLSX
+
+Erwartete Fallzahlen: 33.718 (Rohdaten), 27.157 (netzwerkrelevant), 21.017 (Themenfilter Stufe 1), 17.910 (Themenfilter Stufe 2, finale Stichprobe).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pakete
+
+```{r pakete, message=FALSE}
+library(readxl)   # Import der Rohdaten (xlsx)
+library(dplyr)    # Datenaufbereitung
+library(tidyr)    # replace_na()
+library(stringr)  # Textmuster (reguläre Ausdrücke)
+library(readr)    # Export als csv und rds
+library(writexl)  # Export als xlsx
+library(here)     # Pfade relativ zum Projektordner
+```
+
+# 1. Import
+
+```{r import}
+
+# Alle Spalten werden zunächst als Text eingelesen. Hintergrund: Die Beitrags-IDs von X haben 19 Stellen. Als Zahl eingelesen würden sie
+# gerundet und wären danach nicht mehr eindeutig zuordenbar.
+#
+# Anschließend werden nur die Spalten umgewandelt, die tatsächlich als Zahl oder Wahrheitswert gebraucht werden:
+#   - is_quote_tweet, is_reply, is_retweet: "TRUE"/"FALSE" als Text wird zu einem Wahrheitswert. Fehlende Werte gelten als FALSE, damit die
+#     Filter weiter unten keine Zeilen wegen NA verlieren.
+#   - Zählvariablen und Zeitstempel: Text wird zu ganzen Zahlen.
+
+tweets_raw <- read_excel(here("data", "Tweets_Rohdaten.xlsx"), col_types = "text") %>%
+              mutate(across(c(is_quote_tweet, is_reply, is_retweet),
+                            ~ replace_na(as.logical(.x), FALSE)),
+                     across(c(retweet_count, reply_count, like_count, quote_count, impression_count, unix_timestamp), as.integer))
+
+# Kontrolle: Zahl der X-Beiträge in den Rohdaten
+
+nrow(tweets_raw)
+
+# Kontrolle: X-Beiträge je Medium in den Rohdaten
+
+tweets_raw %>%
+  count(media_company, name = "n_tweets") %>%
+  arrange(desc(n_tweets))
+```
+
+# 2. Netzwerkrelevante X-Beiträge
+
+```{r netzwerk-filter}
+
+# Für die Netzwerkanalyse zählen nur X-Beiträge, die eine Bezugnahme auf einen anderen Account enthalten. Ein Beitrag ohne Bezugnahme erzeugt
+# keine Kante und wird deshalb ausgeschlossen.
+#
+# Ein Beitrag bleibt erhalten, wenn mindestens eine Bedingung zutrifft:
+#   - Mention: die Spalte "mentions" ist gefüllt
+#   - Quote:   is_quote_tweet ist TRUE
+#   - Reply:   is_reply ist TRUE
+#   - Retweet: is_retweet ist TRUE
+#
+# Bei den Mentions werden drei Formen von "leer" abgefangen: fehlender Wert (NA), leere Zeichenkette und der Platzhalter "N/A".
+
+tweets_network <- tweets_raw %>%
+  filter((!is.na(mentions) & str_trim(mentions) != "" & mentions != "N/A") |
+           is_quote_tweet == TRUE |
+           is_reply == TRUE |
+           is_retweet == TRUE)
+
+# Kontrolle: Zahl der netzwerkrelevanten X-Beiträge
+
+nrow(tweets_network)
+```
+
+# 3. Themenfilter
+
+Der Themenfilter arbeitet in zwei Stufen. Stufe 1 wählt alle X-Beiträge mit einem Begriff zum Gaza-Diskurs aus. Stufe 2 entfernt daraus Beiträge, die sich
+auf einen angrenzenden Konflikt beziehen, ohne Gaza ausdrücklich zu nennen.
+
+```{r themen-muster}
+
+# Aufbau der Suchmuster:
+#   \\b          Wortgrenze, der Begriff muss am Wortanfang stehen
+#   \\w*         beliebig viele weitere Buchstaben, erfasst Beugungen und
+#                Zusammensetzungen (z.B. "Gazastreifen", "israelische")
+#   ignore_case  Groß- und Kleinschreibung wird nicht unterschieden
+#
+# Die Begriffe decken deutsche und englische Schreibweisen ab.
+# "waffenruhe" steht ohne \\w* und wird nur als ganzes Wort gefunden.
+
+# Stufe 1: Begriffe zum Gaza-Diskurs
+# "\u00e4" steht für "ä". Die Schreibweise stellt sicher, dass das Muster auf jedem Betriebssystem gleich gelesen wird.
+
+pattern_topic <- regex("\\b(gaza\\w*|hamas\\w*|geisel\\w*|hostage\\w*|waffenruhe|ceasefire\\w*|pal\u00e4stin\\w*|palestin\\w*|israel\\w*)\\b",ignore_case = TRUE)
+
+# Stufe 2: Begriffe angrenzender Konflikte
+# (Ukraine/Russland, Iran, Hisbollah/Libanon, Huthi/Jemen)
+
+pattern_exclusion <- regex(
+  "\\b(ukraine\\w*|russland\\w*|russia\\w*|iran\\w*|hisbollah\\w*|hezbollah\\w*|libanon\\w*|lebanon\\w*|huthi\\w*|houthi\\w*|jemen\\w*|yemen\\w*)\\b", ignore_case = TRUE)
+
+# Ausdrückliche Nennung von Gaza, hebt den Ausschluss aus Stufe 2 auf
+
+pattern_gaza <- regex("\\bgaza\\w*\\b", ignore_case = TRUE)
+```
+
+```{r themen-filter}
+
+# Stufe 1
+#
+# Geprüft wird nicht nur der eigene Text (body), sondern auch der Text des retweeteten (retweet_body) und des zitierten Beitrags (quote_body). Bei
+# Retweets ist der eigene Text in den Rohdaten nur gekürzt erfasst, bei Quotes steht der Themenbezug oft nur im zitierten Beitrag. Die drei Texte werden zu
+# "text_check" verbunden, fehlende Texte dabei durch eine leere Zeichenkette ersetzt.
+
+tweets_topic <- tweets_network %>%
+  mutate(text_check  = paste(coalesce(body, ""), coalesce(retweet_body, ""), coalesce(quote_body, "")),
+         topic_match = str_detect(text_check, pattern_topic)) %>%
+  filter(topic_match)
+
+# Kontrolle: Zahl der X-Beiträge nach Stufe 1
+
+nrow(tweets_topic)
+
+# Stufe 2
+#
+# Zwei Hilfsvariablen:
+#   - exclusion_flag: der Text nennt einen angrenzenden Konflikt
+#   - gaza_explizit:  der Text nennt Gaza ausdrücklich
+#
+# Entfernt wird ein Beitrag nur, wenn er einen angrenzenden Konflikt nennt UND Gaza nicht ausdrücklich erwähnt. Beiträge, die beides ansprechen,
+# bleiben in der Stichprobe.
+#
+# row_id nummeriert die verbleibenden Beiträge fortlaufend und dient in den weiteren Skripten als eindeutiger Schlüssel.
+
+tweets_topic_final <- tweets_topic %>%
+  mutate(exclusion_flag = str_detect(text_check, pattern_exclusion),
+         gaza_explizit  = str_detect(text_check, pattern_gaza)) %>%
+  filter(!(exclusion_flag & !gaza_explizit)) %>%
+  mutate(row_id = row_number())
+
+# Kontrolle: Zahl der X-Beiträge in der finalen Stichprobe
+
+nrow(tweets_topic_final)
+```
+
+# 4. Überblick über die Stichprobe
+
+```{r ueberblick}
+# X-Beiträge je Medium in der finalen Stichprobe
+tweets_final_authors <- tweets_topic_final %>%
+  count(media_company, name = "n_tweets") %>%
+  arrange(desc(n_tweets))
+
+tweets_final_authors
+
+# Journalist:innen je Medium. Gezählt wird über den Klarnamen
+# (author_fullname), nicht über das Handle, weil sich Handles im Untersuchungszeitraum ändern können.
+
+seed_nodes_by_medium <- tweets_topic_final %>%
+  distinct(media_company, author_fullname) %>%
+  count(media_company, name = "n_seed_nodes") %>%
+  arrange(desc(n_seed_nodes))
+
+seed_nodes_by_medium
+
+# Liste aller Journalist:innen mit der Zahl ihrer X-Beiträge.
+# Zeilen ohne Klarnamen werden nicht mitgezählt.
+
+seed_list <- tweets_topic_final %>%
+  filter(!is.na(author_fullname), author_fullname != "") %>%
+  count(media_company, author_fullname, name = "n_tweets") %>%
+  arrange(media_company, author_fullname)
+
+# Kontrolle: Zahl der Journalist:innen in der Liste
+
+nrow(seed_list)
+```
+
+# 5. Export
+
+```{r export}
+
+# Liste der Journalist:innen
+write_xlsx(seed_list, here("data", "Egoliste_FINAL.xlsx"))
+
+# Finale Stichprobe in drei Formaten:
+#   - xlsx: zur Durchsicht in Excel
+#   - csv:  als offenes Austauschformat
+#   - rds:  für die weiteren Skripte. Das Format behält die Datentypen, die IDs bleiben also Text und werden nicht gerundet.
+
+write_xlsx(tweets_topic_final, here("data", "Tweet_Stichprobe_BEREINIGT.xlsx"))
+write_csv(tweets_topic_final, here("data", "tweets_topic_final.csv"))
+write_rds(tweets_topic_final, here("data", "tweets_topic_final.rds"))
+```
