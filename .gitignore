@@ -1,0 +1,40 @@
+# --- Daten (personenbezogen, nicht veröffentlichen) ---
+data/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.rds
+*.RData
+*.rda
+*.ndjson
+*.json
+
+# --- Geknittete Ausgaben (enthalten Datenausschnitte und Accountnamen) ---
+*.html
+*.nb.html
+*_files/
+*_cache/
+
+# --- R und RStudio ---
+.Rproj.user/
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Renviron
+
+
+# --- Zugangsdaten ---
+.env
+*.key
+*token*
+
+# --- Word-Dokumente (Arbeit und exportierte Tabellen) ---
+*.docx
+~$*
+
+# --- Betriebssystem ---
+.DS_Store
+Thumbs.db
+desktop.ini
